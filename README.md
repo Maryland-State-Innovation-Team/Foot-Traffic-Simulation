@@ -66,12 +66,14 @@ If cached data exists, the script will use it to speed up subsequent runs.
 	- Generates hourly heatmaps of foot traffic on the road network.
 	- Creates an animated GIF showing the evolution of foot traffic over a 24-hour period.
 
+
 ## Output Files
 
 - `cache/acs_detailed_commute_data.csv` — Cached ACS commute data
 - `cache/lodes_od_md.csv.gz` — Cached LODES job flow data
 - `cache/baltimore_roads.graphml` — Cached OSM road network
 - `cache/baltimore_transit_expanded.geojson` — Cached OSM transit features
+- `cache/baltimore_tracts_2023.geojson` — Cached Baltimore census tract geometries
 - `cache/foot_traffic_detailed.geojson` — Simulated hourly foot traffic (GeoJSON)
 - `foot_traffic_animation_detailed.gif` — Animated heatmap of hourly foot traffic
 

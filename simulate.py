@@ -7,8 +7,9 @@ import osmnx as ox
 import networkx as nx
 import matplotlib.pyplot as plt
 import contextily as cx
-import imageio
+import imageio.v2 as imageio
 from shapely.geometry import Point
+from shapely.ops import nearest_points
 import urllib.request
 import zipfile
 from dotenv import load_dotenv
@@ -36,6 +37,7 @@ BALTIMORE_ROADS_FILE = os.path.join(CACHE_DIR, "baltimore_roads.graphml")
 BALTIMORE_TRANSIT_FILE = os.path.join(CACHE_DIR, "baltimore_transit_expanded.geojson")
 TRACT_SHAPEFILE_CACHE = os.path.join(CACHE_DIR, "baltimore_tracts_2023.geojson")
 TRACT_ZIP_FILE = os.path.join(CACHE_DIR, "tracts_2023.zip")
+TRACT_SHP_FILE = os.path.join(CACHE_DIR, "tl_2023_24_tract.shp")
 FOOT_TRAFFIC_CACHE = os.path.join(CACHE_DIR, "foot_traffic_detailed.geojson")
 ANIMATION_FILE = "foot_traffic_animation_detailed.gif"
 
@@ -54,16 +56,15 @@ def get_tract_geometries(file_path, state_fips, county_fips):
     with zipfile.ZipFile(TRACT_ZIP_FILE, 'r') as zip_ref:
         zip_ref.extractall(CACHE_DIR)
     
-    shp_filename = TRACT_ZIP_FILE.replace(".zip", ".shp")
-    tracts_gdf = gpd.read_file(shp_filename)
+    tracts_gdf = gpd.read_file(TRACT_SHP_FILE)
     tracts_gdf = tracts_gdf[tracts_gdf['COUNTYFP'] == county_fips]
     tracts_gdf['GEOID'] = tracts_gdf['STATEFP'] + tracts_gdf['COUNTYFP'] + tracts_gdf['TRACTCE']
     tracts_gdf.to_file(file_path, driver='GeoJSON')
     
     os.remove(TRACT_ZIP_FILE)
-    for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg', '.xml']:
+    for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg', '.shp.ea.iso.xml', 'shp.iso.xml']:
         try:
-            os.remove(shp_filename.replace('.shp', ext))
+            os.remove(TRACT_SHP_FILE.replace('.shp', ext))
         except FileNotFoundError:
             pass
             
@@ -160,8 +161,16 @@ def run_simulation():
     variable_map = define_acs_variables()
     acs_data = get_acs_data(list(variable_map.keys()), ACS_DATA_FILE)
     lodes_data = get_lodes_data(LODES_FILE)
-    roads, _ = get_osm_data(BALTIMORE_ROADS_FILE, BALTIMORE_TRANSIT_FILE)
+    # Aggregate S000 by first 11 digits of h_geocode and w_geocode
+    lodes_data['h_geocode'] = lodes_data['h_geocode'].astype(str).str[:11]
+    lodes_data['w_geocode'] = lodes_data['w_geocode'].astype(str).str[:11]
+    lodes_data = lodes_data.groupby(['h_geocode', 'w_geocode'])['S000'].sum().reset_index()
+    roads, transit = get_osm_data(BALTIMORE_ROADS_FILE, BALTIMORE_TRANSIT_FILE)
     _, edges = ox.graph_to_gdfs(roads)
+    transit = transit.to_crs(edges.crs)
+    # Pre-calculate the union_all() of all transit geometries for efficient use with nearest_points
+    transit_geometries_union = transit.geometry.union_all()
+
     hourly_foot_traffic = {hour: edges.copy() for hour in range(24)}
     for hour in range(24):
         hourly_foot_traffic[hour]['foot_traffic'] = 0
@@ -194,7 +203,7 @@ def run_simulation():
                 home_edge = roads_in_home_tract.sample(1).iloc[0]
 
                 # --- Sleep Schedule ---
-                sleep_duration = np.random.uniform(5, 9)
+                sleep_duration = np.random.uniform(7, 9)
                 
                 # --- Work from Home ---
                 if mode == 'wfh':
@@ -224,31 +233,67 @@ def run_simulation():
                 # --- Sleep Schedule ---
                 sleep_start_hour = (departure_hour - sleep_duration - 1 + 24) % 24
 
-                # --- Simulate 24h path ---
+                # --- Pre-calculate commute paths for this worker ---
+                commute_paths = {}
+                try:
+                    home_node, work_node = home_edge.name[0], work_edge.name[1]
+                    if home_node != work_node:
+                        if mode in ['walk', 'other']:
+                            path_to = ox.shortest_path(roads, home_node, work_node, weight='length')
+                            path_from = ox.shortest_path(roads, work_node, home_node, weight='length')
+                            if path_to and len(path_to) > 1: commute_paths['morning'] = path_to
+                            if path_from and len(path_from) > 1: commute_paths['evening'] = path_from
+                        elif mode == 'transit':
+                            home_transit_geom = nearest_points(home_edge.geometry.centroid, transit_geometries_union)[1]
+                            work_transit_geom = nearest_points(work_edge.geometry.centroid, transit_geometries_union)[1]
+                            home_transit_node = ox.nearest_nodes(roads, home_transit_geom.x, home_transit_geom.y)
+                            work_transit_node = ox.nearest_nodes(roads, work_transit_geom.x, work_transit_geom.y)
+
+                            # Morning commute paths
+                            path_m1 = ox.shortest_path(roads, home_node, home_transit_node, weight='length')
+                            path_m2 = ox.shortest_path(roads, work_transit_node, work_node, weight='length')
+                            if path_m1 and len(path_m1) > 1: commute_paths['morning_leg1'] = path_m1
+                            if path_m2 and len(path_m2) > 1: commute_paths['morning_leg2'] = path_m2
+
+                            # Evening commute paths (reversed origins/destinations)
+                            path_e1 = ox.shortest_path(roads, work_node, work_transit_node, weight='length')
+                            path_e2 = ox.shortest_path(roads, home_transit_node, home_node, weight='length')
+                            if path_e1 and len(path_e1) > 1: commute_paths['evening_leg1'] = path_e1
+                            if path_e2 and len(path_e2) > 1: commute_paths['evening_leg2'] = path_e2
+                except (nx.NetworkXNoPath, ValueError):
+                    commute_paths = {}
+
+                # --- Simulate hourly activity for this worker ---
                 for hour in range(24):
-                    is_sleeping = (sleep_start_hour <= hour < (sleep_start_hour + sleep_duration)) or \
-                                  ((sleep_start_hour + sleep_duration) > 24 and hour < (sleep_start_hour + sleep_duration) % 24)
+                    hour_float = hour + 0.5 # Use mid-hour for comparisons
+                    is_sleeping = (sleep_start_hour <= hour_float < (sleep_start_hour + sleep_duration)) or ((sleep_start_hour + sleep_duration) > 24 and hour_float < (sleep_start_hour + sleep_duration) % 24)
                     if is_sleeping: continue
                     
-                    if hour < departure_hour or hour >= return_arrival: # At home
-                        hourly_foot_traffic[hour].loc[home_edge.name, 'foot_traffic'] += 1
-                    elif arrival_hour <= hour < return_departure: # At work
+                    if arrival_hour <= hour_float < return_departure: # At work
                         hourly_foot_traffic[hour].loc[work_edge.name, 'foot_traffic'] += 1
-                    elif departure_hour <= hour < arrival_hour: # Commuting to work
-                        if mode in ['walk', 'other']:
-                            try:
-                                path = ox.shortest_path(roads, home_edge['u'], work_edge['v'], weight='length')
-                                path_edges = ox.utils_graph.get_route_edge_attributes(roads, path)
-                                for edge in path_edges:
-                                    hourly_foot_traffic[hour].loc[(edge['u'], edge['v'], edge['key']), 'foot_traffic'] += 1
-                            except nx.NetworkXNoPath:
-                                hourly_foot_traffic[hour].loc[home_edge.name, 'foot_traffic'] += 1 # Default to home
-                        elif mode == 'transit':
-                            # Foot traffic to/from nearest transit
-                            home_node = ox.nearest_nodes(roads, home_edge.geometry.centroid.x, home_edge.geometry.centroid.y)
-                            work_node = ox.nearest_nodes(roads, work_edge.geometry.centroid.x, work_edge.geometry.centroid.y)
-                            hourly_foot_traffic[hour].loc[home_edge.name, 'foot_traffic'] += 1
-                            hourly_foot_traffic[hour].loc[work_edge.name, 'foot_traffic'] += 1
+                    elif departure_hour <= hour_float < arrival_hour: # Commute to work
+                        if 'morning' in commute_paths:
+                            route_gdf = ox.routing.route_to_gdf(roads, commute_paths['morning'])
+                            for idx in route_gdf.index: hourly_foot_traffic[hour].loc[idx, 'foot_traffic'] += 1
+                        if 'morning_leg1' in commute_paths:
+                            route_gdf = ox.routing.route_to_gdf(roads, commute_paths['morning_leg1'])
+                            for idx in route_gdf.index: hourly_foot_traffic[hour].loc[idx, 'foot_traffic'] += 1
+                        if 'morning_leg2' in commute_paths:
+                            route_gdf = ox.routing.route_to_gdf(roads, commute_paths['morning_leg2'])
+                            for idx in route_gdf.index: hourly_foot_traffic[hour].loc[idx, 'foot_traffic'] += 1
+                    elif return_departure <= hour_float < return_arrival: # Commute from work
+                        if 'evening' in commute_paths:
+                            route_gdf = ox.routing.route_to_gdf(roads, commute_paths['evening'])
+                            for idx in route_gdf.index: hourly_foot_traffic[hour].loc[idx, 'foot_traffic'] += 1
+                        if 'evening_leg1' in commute_paths:
+                            route_gdf = ox.routing.route_to_gdf(roads, commute_paths['evening_leg1'])
+                            for idx in route_gdf.index: hourly_foot_traffic[hour].loc[idx, 'foot_traffic'] += 1
+                        if 'evening_leg2' in commute_paths:
+                            route_gdf = ox.routing.route_to_gdf(roads, commute_paths['evening_leg2'])
+                            for idx in route_gdf.index: hourly_foot_traffic[hour].loc[idx, 'foot_traffic'] += 1
+                    else: # At home
+                        hourly_foot_traffic[hour].loc[home_edge.name, 'foot_traffic'] += 1
+
     pbar.close()
 
     # --- 3. Cache Foot Traffic Data ---
@@ -261,7 +306,7 @@ def run_simulation():
 
 # --- Visualization ---
 def create_animation(foot_traffic_data):
-    """Creates an animated heatmap of foot traffic with a tqdm progress bar."""
+    """Creates an animated heatmap of foot traffic with a custom legend."""
     print("Creating animation...")
     if foot_traffic_data.empty:
         print("Foot traffic data is empty. Cannot create animation.")
@@ -269,30 +314,54 @@ def create_animation(foot_traffic_data):
 
     filenames = []
     vmax = foot_traffic_data['foot_traffic'].quantile(0.99)
+    if vmax == 0: vmax = 1
     
     for hour in tqdm(range(24), desc="Creating Animation Frames"):
         fig, ax = plt.subplots(figsize=(12, 12))
         hour_data = foot_traffic_data[foot_traffic_data['hour'] == hour]
         
+        # --- Convert hour to AM/PM format ---
+        if hour == 0:
+            time_str = "12:00 AM"
+        elif hour < 12:
+            time_str = f"{hour}:00 AM"
+        elif hour == 12:
+            time_str = "12:00 PM"
+        else:
+            time_str = f"{hour - 12}:00 PM"
+
+        title = f"Foot Traffic in Baltimore - {time_str}"
+        
         if hour_data.empty: 
-            # Create a blank frame if no traffic for this hour
-            ax.set_title(f"Foot Traffic in Baltimore - {hour:02d}:00 (No Traffic)", fontsize=16)
+            ax.set_title(f"{title} (No Traffic)", fontsize=16)
         else:
             hour_data.plot(ax=ax, linewidth=np.clip(hour_data['foot_traffic'] / vmax * 5, 0.1, 5),
                          edgecolor='purple', alpha=0.7)
-            ax.set_title(f"Foot Traffic in Baltimore - {hour:02d}:00", fontsize=16)
+            ax.set_title(title, fontsize=16)
 
         ax.set_xticks([]); ax.set_yticks([])
         cx.add_basemap(ax, crs=foot_traffic_data.crs.to_string(), source=cx.providers.CartoDB.Positron)
-        plt.tight_layout()
+        
+        legend_values = sorted(list(set([int(vmax * 0.25), int(vmax * 0.5), int(vmax)])))
+        if len(legend_values) > 1 and legend_values[0] == 0: legend_values.pop(0)
 
+        ax.text(0.02, 0.12, "Foot Traffic", transform=ax.transAxes, fontsize=12, weight='bold', color='#333333')
+        
+        y_pos = 0.10
+        for val in legend_values:
+            lw = np.clip(val / vmax * 5, 0.1, 5)
+            ax.plot([0.02, 0.12], [y_pos, y_pos], color='purple', linewidth=lw, solid_capstyle='round', transform=ax.transAxes)
+            ax.text(0.14, y_pos, f"{val} people", transform=ax.transAxes, fontsize=10, verticalalignment='center', color='#333333')
+            y_pos -= 0.03
+
+        plt.tight_layout()
         filename = f"{CACHE_DIR}/frame_{hour:02d}.png"
         plt.savefig(filename, dpi=100)
         plt.close()
         filenames.append(filename)
 
     print("Building GIF...")
-    with imageio.get_writer(ANIMATION_FILE, mode='I', duration=0.5) as writer:
+    with imageio.get_writer(ANIMATION_FILE, mode='I', duration=0.5, loop=0) as writer:
         for filename in filenames:
             image = imageio.imread(filename)
             writer.append_data(image)
