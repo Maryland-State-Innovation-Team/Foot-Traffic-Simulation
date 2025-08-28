@@ -10,9 +10,12 @@ import contextily as cx
 from matplotlib.animation import FuncAnimation
 import imageio
 from shapely.geometry import Point
+from tqdm import tqdm
+from dotenv import load_dotenv
 
 # --- Configuration ---
-CENSUS_API_KEY = "YOUR_CENSUS_API_KEY"
+load_dotenv()
+CENSUS_API_KEY = os.getenv("CENSUS_API_KEY", "YOUR_CENSUS_API_KEY")
 CITY_NAME = "Baltimore, Maryland"
 STATE_FIPS = '24' # Maryland
 COUNTY_FIPS = '510' # Baltimore City
@@ -141,7 +144,7 @@ def run_simulation():
     tracts_geo = cenpy.products.Decennial2020().from_place(CITY_NAME, level='tract', variables=['GEOID'])
     tracts_geo = tracts_geo.to_crs(edges.crs)
 
-    for _, home_tract in acs_data.iterrows():
+    for _, home_tract in tqdm(acs_data.iterrows()):
         home_tract_geoid = home_tract['GEOID']
         print(f"Simulating tract {home_tract_geoid}...")
         

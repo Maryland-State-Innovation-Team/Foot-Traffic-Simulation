@@ -31,11 +31,7 @@ This project requires a U.S. Census API key to download ACS data.
 	- Register for free at: https://api.census.gov/data/key_signup.html
 
 2. **Configure your API key:**
-	- Open `simulate.py` and replace the placeholder:
-	  ```python
-	  CENSUS_API_KEY = "YOUR_CENSUS_API_KEY"
-	  ```
-	  with your actual API key string.
+	- Create a .env file with your CENSUS_API_KEY=YOUR-CENSUS-KEY-HERE
 
 ## Usage
 
