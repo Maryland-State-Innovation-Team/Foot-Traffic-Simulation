@@ -7,15 +7,18 @@ import osmnx as ox
 import networkx as nx
 import matplotlib.pyplot as plt
 import contextily as cx
-from matplotlib.animation import FuncAnimation
 import imageio
 from shapely.geometry import Point
-from tqdm import tqdm
+import urllib.request
+import zipfile
 from dotenv import load_dotenv
+from tqdm import tqdm
+
+# --- Load Environment Variables ---
+load_dotenv()
 
 # --- Configuration ---
-load_dotenv()
-CENSUS_API_KEY = os.getenv("CENSUS_API_KEY", "YOUR_CENSUS_API_KEY")
+CENSUS_API_KEY = os.getenv("CENSUS_API_KEY")
 CITY_NAME = "Baltimore, Maryland"
 STATE_FIPS = '24' # Maryland
 COUNTY_FIPS = '510' # Baltimore City
@@ -31,11 +34,40 @@ ACS_DATA_FILE = os.path.join(CACHE_DIR, "acs_detailed_commute_data.csv")
 LODES_FILE = os.path.join(CACHE_DIR, "lodes_od_md.csv.gz")
 BALTIMORE_ROADS_FILE = os.path.join(CACHE_DIR, "baltimore_roads.graphml")
 BALTIMORE_TRANSIT_FILE = os.path.join(CACHE_DIR, "baltimore_transit_expanded.geojson")
+TRACT_SHAPEFILE_CACHE = os.path.join(CACHE_DIR, "baltimore_tracts_2023.geojson")
+TRACT_ZIP_FILE = os.path.join(CACHE_DIR, "tracts_2023.zip")
 FOOT_TRAFFIC_CACHE = os.path.join(CACHE_DIR, "foot_traffic_detailed.geojson")
 ANIMATION_FILE = "foot_traffic_animation_detailed.gif"
 
-
 # --- Helper Functions ---
+
+def get_tract_geometries(file_path, state_fips, county_fips):
+    """Downloads and caches 2023 TIGER/Line shapefile for census tracts."""
+    if os.path.exists(file_path):
+        print(f"Loading cached tract geometries from {file_path}...")
+        return gpd.read_file(file_path)
+    
+    print("Downloading 2023 TIGER/Line shapefile for census tracts...")
+    url = f"https://www2.census.gov/geo/tiger/TIGER2023/TRACT/tl_2023_{state_fips}_tract.zip"
+    urllib.request.urlretrieve(url, TRACT_ZIP_FILE)
+    
+    with zipfile.ZipFile(TRACT_ZIP_FILE, 'r') as zip_ref:
+        zip_ref.extractall(CACHE_DIR)
+    
+    shp_filename = TRACT_ZIP_FILE.replace(".zip", ".shp")
+    tracts_gdf = gpd.read_file(shp_filename)
+    tracts_gdf = tracts_gdf[tracts_gdf['COUNTYFP'] == county_fips]
+    tracts_gdf['GEOID'] = tracts_gdf['STATEFP'] + tracts_gdf['COUNTYFP'] + tracts_gdf['TRACTCE']
+    tracts_gdf.to_file(file_path, driver='GeoJSON')
+    
+    os.remove(TRACT_ZIP_FILE)
+    for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg', '.xml']:
+        try:
+            os.remove(shp_filename.replace('.shp', ext))
+        except FileNotFoundError:
+            pass
+            
+    return tracts_gdf
 
 def get_acs_data(variables, file_path):
     """Downloads and caches detailed ACS data."""
@@ -43,10 +75,10 @@ def get_acs_data(variables, file_path):
         print(f"Loading cached ACS data from {file_path}...")
         return pd.read_csv(file_path, dtype={'GEOID': str})
     else:
-        if CENSUS_API_KEY == "YOUR_CENSUS_API_KEY":
-            raise ValueError("Please replace 'YOUR_CENSUS_API_KEY' with your actual Census API key.")
+        if not CENSUS_API_KEY:
+            raise ValueError("Census API key not found. Please create a .env file with CENSUS_API_KEY='your_key'")
         print("Downloading detailed ACS data...")
-        conn = cenpy.remote.APIConnection(f"ACSDT5Y{YEAR}")
+        conn = cenpy.remote.APIConnection(f"ACSDT5Y{YEAR}", key=CENSUS_API_KEY)
         g_filter = {'state': STATE_FIPS, 'county': COUNTY_FIPS}
         data = conn.query(variables, geo_unit='tract', geo_filter=g_filter)
         data['GEOID'] = data['state'] + data['county'] + data['tract']
@@ -57,7 +89,7 @@ def get_lodes_data(file_path):
     """Downloads and caches LODES data for the entire state."""
     if os.path.exists(file_path):
         print(f"Loading cached LODES data from {file_path}...")
-        return pd.read_csv(file_path)
+        return pd.read_csv(file_path, dtype={'w_geocode': str, 'h_geocode': str})
     else:
         print("Downloading LODES data...")
         url = f"https://lehd.ces.census.gov/data/lodes/LODES8/md/od/md_od_main_JT01_{LODES_YEAR}.csv.gz"
@@ -68,7 +100,7 @@ def get_lodes_data(file_path):
         return data
 
 def get_osm_data(roads_file, transit_file):
-    """Downloads and caches OpenStreetMap data with expanded transit tags."""
+    """Downloads and caches OpenStreetMap data."""
     if os.path.exists(roads_file):
         print("Loading cached roads data...")
         roads = ox.load_graphml(roads_file)
@@ -107,11 +139,9 @@ def define_acs_variables():
     }
     
     modes = {
-        'drive': range(17, 31),    # Drove alone
-        'carpool': range(32, 46),  # Carpooled
-        'transit': range(47, 61),  # Public transit
-        'walk': range(62, 76),     # Walked
-        'other': range(77, 91)     # Other means (incl. bicycle)
+        'drive': range(17, 31), 'carpool': range(32, 46),
+        'transit': range(47, 61), 'walk': range(62, 76),
+        'other': range(77, 91)
     }
 
     time_keys = list(time_windows.keys())
@@ -129,51 +159,46 @@ def run_simulation():
     # --- 1. Data Acquisition and Preparation ---
     variable_map = define_acs_variables()
     acs_data = get_acs_data(list(variable_map.keys()), ACS_DATA_FILE)
-    
     lodes_data = get_lodes_data(LODES_FILE)
-    roads, transit = get_osm_data(BALTIMORE_ROADS_FILE, BALTIMORE_TRANSIT_FILE)
-    
-    nodes, edges = ox.graph_to_gdfs(roads)
-    edges['foot_traffic'] = 0
+    roads, _ = get_osm_data(BALTIMORE_ROADS_FILE, BALTIMORE_TRANSIT_FILE)
+    _, edges = ox.graph_to_gdfs(roads)
     hourly_foot_traffic = {hour: edges.copy() for hour in range(24)}
+    for hour in range(24):
+        hourly_foot_traffic[hour]['foot_traffic'] = 0
 
-    # --- 2. Simulation Logic ---
+    tracts_geo = get_tract_geometries(TRACT_SHAPEFILE_CACHE, STATE_FIPS, COUNTY_FIPS).to_crs(edges.crs)
+
+    # --- 2. Simulation Logic with tqdm ---
     print("Running detailed simulation...")
-    
-    # Get Baltimore census tracts geometry
-    tracts_geo = cenpy.products.Decennial2020().from_place(CITY_NAME, level='tract', variables=['GEOID'])
-    tracts_geo = tracts_geo.to_crs(edges.crs)
-
-    for _, home_tract in tqdm(acs_data.iterrows()):
+    pbar = tqdm(acs_data.iterrows(), total=len(acs_data), desc="Simulating Tracts")
+    for _, home_tract in pbar:
         home_tract_geoid = home_tract['GEOID']
-        print(f"Simulating tract {home_tract_geoid}...")
+        pbar.set_postfix_str(f"Tract {home_tract_geoid}")
         
         try:
             home_tract_geom = tracts_geo[tracts_geo['GEOID'] == home_tract_geoid].iloc[0].geometry
             roads_in_home_tract = edges[edges.intersects(home_tract_geom)]
-            if roads_in_home_tract.empty:
-                continue
+            if roads_in_home_tract.empty: continue
         except IndexError:
             continue # Skip if tract geometry not found
 
         # J2J data for this specific home tract
         od_pairs = lodes_data[lodes_data['h_geocode'] == home_tract_geoid]
-
+        
         for var, (mode, time_window) in variable_map.items():
             num_workers = int(home_tract[var])
-            if num_workers <= 0:
-                continue
+            if num_workers <= 0: continue
 
             for _ in range(num_workers):
                 # --- Assign Home ---
                 home_edge = roads_in_home_tract.sample(1).iloc[0]
-                
+
                 # --- Sleep Schedule ---
                 sleep_duration = np.random.uniform(5, 9)
                 
                 # --- Work from Home ---
                 if mode == 'wfh':
-                    work_start_hour = np.random.normal(9, 1) # Assume 9am start
+                    work_start_hour = np.random.normal(9, 1)
                     sleep_start_hour = (work_start_hour - sleep_duration - 1 + 24) % 24
                     for hour in range(24):
                         if not (sleep_start_hour <= hour < (sleep_start_hour + sleep_duration) % 24):
@@ -181,23 +206,19 @@ def run_simulation():
                     continue # End simulation for this worker
                 
                 # --- Assign Work Location (based on J2J data) ---
-                if od_pairs.empty:
-                    continue # No destination data for this tract
-                
+                if od_pairs.empty: continue
                 work_tract_geoid = od_pairs.sample(1, weights='S000').iloc[0]['w_geocode']
                 try:
                     work_tract_geom = tracts_geo[tracts_geo['GEOID'] == work_tract_geoid].iloc[0].geometry
                     roads_in_work_tract = edges[edges.intersects(work_tract_geom)]
-                    if roads_in_work_tract.empty:
-                        continue
+                    if roads_in_work_tract.empty: continue
                     work_edge = roads_in_work_tract.sample(1).iloc[0]
-                except (IndexError, ValueError):
-                    continue
+                except (IndexError, ValueError): continue
 
                 # --- Assign Departure Time ---
                 departure_hour = np.random.normal(loc=np.mean(time_window), scale=0.5)
-                arrival_hour = departure_hour + np.random.uniform(0.25, 1.5) # Commute duration
-                return_departure = arrival_hour + 8 # 8-hour workday
+                arrival_hour = departure_hour + np.random.uniform(0.25, 1.5)
+                return_departure = arrival_hour + 8
                 return_arrival = return_departure + (arrival_hour - departure_hour)
 
                 # --- Sleep Schedule ---
@@ -207,9 +228,7 @@ def run_simulation():
                 for hour in range(24):
                     is_sleeping = (sleep_start_hour <= hour < (sleep_start_hour + sleep_duration)) or \
                                   ((sleep_start_hour + sleep_duration) > 24 and hour < (sleep_start_hour + sleep_duration) % 24)
-                    
-                    if is_sleeping:
-                        continue
+                    if is_sleeping: continue
                     
                     if hour < departure_hour or hour >= return_arrival: # At home
                         hourly_foot_traffic[hour].loc[home_edge.name, 'foot_traffic'] += 1
@@ -225,48 +244,46 @@ def run_simulation():
                             except nx.NetworkXNoPath:
                                 hourly_foot_traffic[hour].loc[home_edge.name, 'foot_traffic'] += 1 # Default to home
                         elif mode == 'transit':
-                            # Simplified: foot traffic to/from nearest transit
+                            # Foot traffic to/from nearest transit
                             home_node = ox.nearest_nodes(roads, home_edge.geometry.centroid.x, home_edge.geometry.centroid.y)
                             work_node = ox.nearest_nodes(roads, work_edge.geometry.centroid.x, work_edge.geometry.centroid.y)
                             hourly_foot_traffic[hour].loc[home_edge.name, 'foot_traffic'] += 1
                             hourly_foot_traffic[hour].loc[work_edge.name, 'foot_traffic'] += 1
-
+    pbar.close()
 
     # --- 3. Cache Foot Traffic Data ---
     print("Caching foot traffic data...")
-    all_hours_list = []
-    for hour, gdf in hourly_foot_traffic.items():
-        gdf['hour'] = hour
-        all_hours_list.append(gdf[gdf['foot_traffic'] > 0]) # Cache only edges with traffic
-    
+    all_hours_list = [gdf.assign(hour=hour) for hour, gdf in hourly_foot_traffic.items()]
     all_hours_gdf = pd.concat(all_hours_list)
+    all_hours_gdf = all_hours_gdf[all_hours_gdf['foot_traffic'] > 0]
     all_hours_gdf.to_file(FOOT_TRAFFIC_CACHE, driver='GeoJSON')
     return all_hours_gdf
 
 # --- Visualization ---
 def create_animation(foot_traffic_data):
-    """Creates an animated heatmap of foot traffic."""
+    """Creates an animated heatmap of foot traffic with a tqdm progress bar."""
     print("Creating animation...")
     if foot_traffic_data.empty:
         print("Foot traffic data is empty. Cannot create animation.")
         return
 
     filenames = []
-    vmax = foot_traffic_data['foot_traffic'].quantile(0.99) # Clip for better visualization
+    vmax = foot_traffic_data['foot_traffic'].quantile(0.99)
     
-    for hour in range(24):
+    for hour in tqdm(range(24), desc="Creating Animation Frames"):
         fig, ax = plt.subplots(figsize=(12, 12))
         hour_data = foot_traffic_data[foot_traffic_data['hour'] == hour]
         
-        if hour_data.empty: continue
+        if hour_data.empty: 
+            # Create a blank frame if no traffic for this hour
+            ax.set_title(f"Foot Traffic in Baltimore - {hour:02d}:00 (No Traffic)", fontsize=16)
+        else:
+            hour_data.plot(ax=ax, linewidth=np.clip(hour_data['foot_traffic'] / vmax * 5, 0.1, 5),
+                         edgecolor='purple', alpha=0.7)
+            ax.set_title(f"Foot Traffic in Baltimore - {hour:02d}:00", fontsize=16)
 
-        hour_data.plot(ax=ax, linewidth=np.clip(hour_data['foot_traffic'] / vmax * 5, 0.1, 5),
-                     edgecolor='purple', alpha=0.7)
-
-        ax.set_title(f"Foot Traffic in Baltimore - {hour:02d}:00", fontsize=16)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        cx.add_basemap(ax, crs=hour_data.crs.to_string(), source=cx.providers.CartoDB.Positron)
+        ax.set_xticks([]); ax.set_yticks([])
+        cx.add_basemap(ax, crs=foot_traffic_data.crs.to_string(), source=cx.providers.CartoDB.Positron)
         plt.tight_layout()
 
         filename = f"{CACHE_DIR}/frame_{hour:02d}.png"
